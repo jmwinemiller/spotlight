@@ -1,5 +1,6 @@
-import numpy as np
+from joblib import Parallel, delayed
 
+import numpy as np
 import scipy.stats as st
 
 
@@ -56,7 +57,7 @@ def mrr_score(model, test, train=None):
     return np.array(mrrs)
 
 
-def sequence_mrr_score(model, test, exclude_preceding=False):
+def sequence_mrr_score(model, test, num_threads=1, exclude_preceding=False):
     """
     Compute mean reciprocal rank (MRR) scores. Each sequence
     in test is split into two parts: the first part, containing
@@ -72,6 +73,9 @@ def sequence_mrr_score(model, test, exclude_preceding=False):
         The model to evaluate.
     test: :class:`spotlight.interactions.SequenceInteractions`
         Test interactions.
+    num_threads: int, optional
+        Number of parallel computation threads to use. Should not
+        be higher than the number of physical cores.
     exclude_preceding: boolean, optional
         When true, items already present in the sequence will
         be excluded from evaluation.
@@ -86,20 +90,73 @@ def sequence_mrr_score(model, test, exclude_preceding=False):
     sequences = test.sequences[:, :-1]
     targets = test.sequences[:, -1:]
 
-    mrrs = []
+    results = Parallel(n_jobs=num_threads)(
+        delayed(_get_sequence_mrr_parallel)
+        (model, sequences[i], targets[i], exclude_preceding)
+        for i in range(len(sequences)))
 
-    for i in range(len(sequences)):
+    return np.array(results)
 
-        predictions = -model.predict(sequences[i])
 
-        if exclude_preceding:
-            predictions[sequences[i]] = FLOAT_MAX
+def _get_sequence_mrr_parallel(model, sequence, target, exclude_preceding=False):
 
-        mrr = (1.0 / st.rankdata(predictions)[targets[i]]).mean()
+    predictions = -model.predict(sequence)
+    if exclude_preceding:
+        predictions[sequence] = FLOAT_MAX
+    return (1.0 / st.rankdata(predictions)[target]).mean()
 
-        mrrs.append(mrr)
 
-    return np.array(mrrs)
+def sequence_precision_recall_score(model, test, k=10, num_threads=1, exclude_preceding=False):
+    """
+    Compute sequence precision and recall scores. Each sequence
+    in test is split into two parts: the first part, containing
+    all but the last k elements, is used to predict the last k
+    elements.
+
+    Parameters
+    ----------
+
+    model: fitted instance of a recommender model
+        The model to evaluate.
+    test: :class:`spotlight.interactions.SequenceInteractions`
+        Test interactions.
+    k: int or array of int,
+        The maximum number of predicted items
+    num_threads: int, optional
+        Number of parallel computation threads to use. Should not
+        be higher than the number of physical cores.
+    exclude_preceding: boolean, optional
+        When true, items already present in the sequence will
+        be excluded from evaluation.
+
+    Returns
+    -------
+
+    mrr scores: numpy array of shape (num_users,)
+        Array of MRR scores for each sequence in test.
+    """
+    sequences = test.sequences[:, :-k]
+    targets = test.sequences[:, -k:]
+
+    precision_recalls = Parallel(n_jobs=num_threads)(
+        delayed(_get_precision_recall_parallel)
+        (model, sequences[i], targets[i], k, exclude_preceding)
+        for i in range(len(sequences)))
+
+    precision = np.array(precision_recalls)[:, 0]
+    recall = np.array(precision_recalls)[:, 1]
+    return precision, recall
+
+
+def _get_precision_recall_parallel(model, sequence, target, k, exclude_preceding=False):
+
+    predictions = -model.predict(sequence)
+    if exclude_preceding:
+        predictions[sequence] = FLOAT_MAX
+    predictions = predictions.argsort()[:k]
+    num_hit = len(set(predictions).intersection(set(target)))
+
+    return float(num_hit) / len(predictions), float(num_hit) / len(target)
 
 
 def _get_precision_recall(predictions, targets, k):
